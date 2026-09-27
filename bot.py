@@ -1,1765 +1,581 @@
 import os
+import re
 import sqlite3
 import threading
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    LabeledPrice,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    PreCheckoutQueryHandler,
-    filters,
+    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
+    ContextTypes, PreCheckoutQueryHandler, filters,
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", "10000"))
 DB_FILE = "arajanlat.db"
 
-# ============================================================
-# TELEGRAM STARS ÁRAK
-# ============================================================
-
 PRO_STARS = 1000
 PRO_PLUS_STARS = 3000
-
 PRO_DAYS = 7
 PRO_PLUS_DAYS = 30
-
 SUBSCRIPTION_PERIOD = 2592000
 
-
-# ============================================================
-# RENDER WEB SERVER
-# ============================================================
-
+# -------------------- WEB HEALTH --------------------
 class HealthHandler(BaseHTTPRequestHandler):
-
     def do_GET(self):
         self.send_response(200)
-        self.send_header(
-            "Content-type",
-            "text/plain; charset=utf-8"
-        )
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(
-            b"AI Arjanlat Pro is running!"
-        )
+        self.wfile.write(b"AI Arjanlat Pro is running!")
 
     def log_message(self, format, *args):
-        pass
+        return
 
 
 def run_web_server():
+    HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever()
 
-    server = HTTPServer(
-        ("0.0.0.0", PORT),
-        HealthHandler
-    )
+# -------------------- DATABASE --------------------
+def db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-    server.serve_forever()
-
-
-# ============================================================
-# DATABASE
-# ============================================================
 
 def init_db():
-
-    conn = sqlite3.connect(DB_FILE)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS clients (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            name TEXT,
-            phone TEXT,
-            address TEXT,
-            created_at TEXT
-        )
-    """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS quotes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            client_name TEXT,
-            phone TEXT,
-            address TEXT,
-            work TEXT,
-            quantity TEXT,
-            price TEXT,
-            material TEXT,
-            deadline TEXT,
-            created_at TEXT
-        )
-    """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            plan TEXT,
-            stars INTEGER,
-            expires_at TEXT,
-            is_recurring INTEGER DEFAULT 0,
-            charge_id TEXT,
-            created_at TEXT
-        )
-    """)
-
-    # ========================================================
-    # CÉGADATOK
-    # ========================================================
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS company_data (
-            user_id INTEGER PRIMARY KEY,
-            company_name TEXT,
-            phone TEXT,
-            email TEXT,
-            address TEXT,
-            tax_number TEXT,
-            updated_at TEXT
-        )
-    """)
-
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS clients (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+        name TEXT NOT NULL, phone TEXT, address TEXT, created_at TEXT NOT NULL
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS quotes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+        client_name TEXT, phone TEXT, address TEXT, work TEXT,
+        quantity TEXT, price REAL, material REAL, total REAL, deadline TEXT,
+        quote_number TEXT, created_at TEXT NOT NULL
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS subscriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+        plan TEXT, stars INTEGER, expires_at TEXT, is_recurring INTEGER DEFAULT 0,
+        charge_id TEXT, created_at TEXT NOT NULL
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS company_data (
+        user_id INTEGER PRIMARY KEY, company_name TEXT, phone TEXT, email TEXT,
+        address TEXT, tax_number TEXT, updated_at TEXT
+    )""")
+    # Migration for older installations.
+    cols = {r[1] for r in cur.execute("PRAGMA table_info(quotes)").fetchall()}
+    if "total" not in cols:
+        cur.execute("ALTER TABLE quotes ADD COLUMN total REAL DEFAULT 0")
+    if "quote_number" not in cols:
+        cur.execute("ALTER TABLE quotes ADD COLUMN quote_number TEXT")
     conn.commit()
     conn.close()
 
 
-# ============================================================
-# AKTÍV ELŐFIZETÉS ELLENŐRZÉSE
-# ============================================================
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def get_active_subscription(user_id):
 
-    now = datetime.now().isoformat()
+def money(v):
+    try:
+        return f"{float(v):,.0f}".replace(",", " ") + " Ft"
+    except Exception:
+        return "0 Ft"
 
-    conn = sqlite3.connect(DB_FILE)
 
-    row = conn.execute(
-        """
-        SELECT plan, stars, expires_at, is_recurring
-        FROM subscriptions
-        WHERE user_id = ?
-        AND expires_at > ?
-        ORDER BY expires_at DESC
-        LIMIT 1
-        """,
-        (user_id, now)
-    ).fetchone()
+def parse_number(s):
+    s = str(s).strip().lower().replace("ft", "").replace("huf", "")
+    s = s.replace(" ", "").replace(".", "").replace(",", ".")
+    return float(s)
 
+
+def next_quote_number(user_id):
+    conn = db()
+    row = conn.execute("SELECT COUNT(*) AS n FROM quotes WHERE user_id=?", (user_id,)).fetchone()
+    n = int(row["n"] or 0) + 1
     conn.close()
+    return f"AJ-{datetime.now().strftime('%Y%m%d')}-{n:04d}"
 
-    return row
+# -------------------- SUBSCRIPTIONS --------------------
+def get_active_subscription(user_id):
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM subscriptions WHERE user_id=? ORDER BY id DESC LIMIT 1", (user_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    try:
+        expires = datetime.fromisoformat(row["expires_at"])
+        if expires > datetime.now():
+            return row
+    except Exception:
+        pass
+    return None
 
 
-async def require_subscription(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user_id = update.effective_user.id
-
-    subscription = get_active_subscription(user_id)
-
-    if subscription:
-        return True
-
-    keyboard = InlineKeyboardMarkup([
-
-        [
-            InlineKeyboardButton(
-                "💳 Előfizetések",
-                callback_data="subscription"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "⬅️ Főmenü",
-                callback_data="back_menu"
-            )
-        ],
-    ])
-
-    message = update.callback_query.message
-
-    await message.edit_text(
-
-        "🔒 Ez a funkció aktív előfizetéshez kötött.\n\n"
-
-        "Az AI Árajánlat Pro használatához "
-        "válassz egy előfizetést.\n\n"
-
-        "🔵 PRO – 6 500 Ft / 7 nap\n"
-        "🟣 PRO+ – 20 000 Ft / hó",
-
-        reply_markup=keyboard
+def subscription_text(user_id):
+    sub = get_active_subscription(user_id)
+    if not sub:
+        return "â Nincs aktÃ­v elÅfizetÃ©sed."
+    exp = datetime.fromisoformat(sub["expires_at"]).strftime("%Y.%m.%d. %H:%M")
+    recurring = "Igen" if sub["is_recurring"] else "Nem"
+    return (
+        f"â AktÃ­v elÅfizetÃ©s\n\n"
+        f"ð¦ Csomag: {sub['plan']}\n"
+        f"â­ Stars: {sub['stars']}\n"
+        f"ð LejÃ¡rat: {exp}\n"
+        f"ð Automatikus megÃºjÃ­tÃ¡s: {recurring}"
     )
 
+
+async def require_subscription(update, context):
+    user_id = update.effective_user.id
+    if get_active_subscription(user_id):
+        return True
+    text = (
+        "ð Ez a funkciÃ³ aktÃ­v elÅfizetÃ©shez kÃ¶tÃ¶tt.\n\n"
+        "Az AI ÃrajÃ¡nlat Pro hasznÃ¡latÃ¡hoz vÃ¡lassz egy elÅfizetÃ©st.\n\n"
+        "ðµ PRO â 6 500 Ft / 7 nap\n"
+        "ð£ PRO+ â 20 000 Ft / hÃ³"
+    )
+    kb = [[InlineKeyboardButton("ð³ ElÅfizetÃ©sek", callback_data="subscription")]]
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
     return False
 
-
-# ============================================================
-# FŐMENÜ
-# ============================================================
-
-def main_keyboard():
-
-    return InlineKeyboardMarkup([
-
-        [
-            InlineKeyboardButton(
-                "📝 Új árajánlat",
-                callback_data="new_quote"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "👥 Ügyfeleim",
-                callback_data="clients"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "📋 Ajánlataim",
-                callback_data="quotes"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🤖 AI Segítő",
-                callback_data="ai"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "⚙️ Cégadatok",
-                callback_data="company"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "💳 Előfizetésem",
-                callback_data="subscription"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🆘 Segítség",
-                callback_data="help"
-            )
-        ],
-    ])
-
-
-# ============================================================
-# START
-# ============================================================
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    context.user_data.clear()
-
-    await update.message.reply_text(
-
-        "🤖 AI Árajánlat Pro\n\n"
-
-        "Készíts professzionális árajánlatokat "
-        "gyorsan és egyszerűen.\n\n"
-
-        "Válassz az alábbi menüből:",
-
-        reply_markup=main_keyboard()
-    )
-
-
-async def menu(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    context.user_data.clear()
-
-    await update.message.reply_text(
-        "🤖 Főmenü",
-        reply_markup=main_keyboard()
-    )
-
-
-async def cancel(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    context.user_data.clear()
-
-    await update.message.reply_text(
-
-        "❌ Az aktuális folyamat megszakítva.",
-
-        reply_markup=main_keyboard()
-    )
-
-
-# ============================================================
-# ÚJ ÁRAJÁNLAT
-# ============================================================
-
-async def new_quote(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    if not await require_subscription(
-        update,
-        context
-    ):
-        return
-
-    context.user_data.clear()
-
-    context.user_data["quote_step"] = 1
-
-    await query.edit_message_text(
-
-        "📝 Új árajánlat\n\n"
-
-        "1/8\n"
-        "👤 Írd be az ügyfél nevét:"
-    )
-
-
-# ============================================================
-# CÉGADATOK - SEGÉDFÜGGVÉNY
-# ============================================================
-
+# -------------------- COMPANY DATA --------------------
 def parse_company_data(text):
-
-    data = {
-        "company_name": "",
-        "phone": "",
-        "email": "",
-        "address": "",
-        "tax_number": ""
+    data = {}
+    labels = {
+        "cÃ©gnÃ©v": "company_name", "cegnev": "company_name",
+        "telefonszÃ¡m": "phone", "telefonszam": "phone",
+        "e-mail": "email", "email": "email",
+        "cÃ­m": "address", "cim": "address",
+        "adÃ³szÃ¡m": "tax_number", "adoszam": "tax_number",
     }
-
-    lines = text.splitlines()
-
-    for line in lines:
-
+    for line in text.splitlines():
         if ":" not in line:
             continue
-
-        key, value = line.split(":", 1)
-
-        key = key.strip().lower()
-        value = value.strip()
-
-        if key in ["cégnév", "cegnev"]:
-            data["company_name"] = value
-
-        elif key in [
-            "telefonszám",
-            "telefonszam",
-            "telefon"
-        ]:
-            data["phone"] = value
-
-        elif key in ["e-mail", "email", "e-mail cím", "email cím"]:
-            data["email"] = value
-
-        elif key in ["cím", "cim", "cégcím", "cegcim"]:
-            data["address"] = value
-
-        elif key in ["adószám", "adoszam"]:
-            data["tax_number"] = value
-
+        k, v = line.split(":", 1)
+        k = k.strip().lower()
+        if k in labels:
+            data[labels[k]] = v.strip()
     return data
 
 
 def get_company_data(user_id):
-
-    conn = sqlite3.connect(DB_FILE)
-
-    row = conn.execute(
-        """
-        SELECT
-            company_name,
-            phone,
-            email,
-            address,
-            tax_number
-        FROM company_data
-        WHERE user_id = ?
-        """,
-        (user_id,)
-    ).fetchone()
-
+    conn = db()
+    row = conn.execute("SELECT * FROM company_data WHERE user_id=?", (user_id,)).fetchone()
     conn.close()
-
-    return row
+    return dict(row) if row else None
 
 
 def save_company_data(user_id, data):
+    conn = db()
+    conn.execute("""INSERT INTO company_data(user_id,company_name,phone,email,address,tax_number,updated_at)
+        VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET company_name=excluded.company_name,
+        phone=excluded.phone,email=excluded.email,address=excluded.address,
+        tax_number=excluded.tax_number,updated_at=excluded.updated_at""",
+        (user_id, data["company_name"], data["phone"], data["email"], data["address"], data["tax_number"], now_str()))
+    conn.commit(); conn.close()
 
-    conn = sqlite3.connect(DB_FILE)
 
-    conn.execute(
-        """
-        INSERT INTO company_data
-        (
-            user_id,
-            company_name,
-            phone,
-            email,
-            address,
-            tax_number,
-            updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-
-        ON CONFLICT(user_id)
-        DO UPDATE SET
-            company_name = excluded.company_name,
-            phone = excluded.phone,
-            email = excluded.email,
-            address = excluded.address,
-            tax_number = excluded.tax_number,
-            updated_at = excluded.updated_at
-        """,
-        (
-            user_id,
-            data["company_name"],
-            data["phone"],
-            data["email"],
-            data["address"],
-            data["tax_number"],
-            datetime.now().isoformat()
-        )
+def company_display(data):
+    return (
+        f"ð¢ CÃ©gnÃ©v: {data['company_name']}\n"
+        f"ð Telefon: {data['phone']}\n"
+        f"ð§ E-mail: {data['email']}\n"
+        f"ð  CÃ­m: {data['address']}\n"
+        f"ð§¾ AdÃ³szÃ¡m: {data['tax_number']}"
     )
 
-    conn.commit()
-    conn.close()
+# -------------------- PDF --------------------
+def create_pdf(quote, company, path):
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
 
+    font = "Helvetica"
+    for fp, name in [
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "DejaVuSans"),
+        ("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf", "LiberationSans"),
+    ]:
+        if os.path.exists(fp):
+            try:
+                pdfmetrics.registerFont(TTFont(name, fp)); font = name; break
+            except Exception:
+                pass
 
-# ============================================================
-# CÉGADATOK
-# ============================================================
+    doc = SimpleDocTemplate(path, pagesize=A4, rightMargin=18*mm, leftMargin=18*mm,
+                            topMargin=16*mm, bottomMargin=16*mm)
+    styles = getSampleStyleSheet()
+    title = ParagraphStyle("title", parent=styles["Title"], fontName=font, fontSize=20, alignment=TA_CENTER, spaceAfter=8)
+    normal = ParagraphStyle("normal", parent=styles["Normal"], fontName=font, fontSize=9, leading=13)
+    right = ParagraphStyle("right", parent=normal, alignment=TA_RIGHT)
+    story = [Paragraph("ÃRAJÃNLAT", title)]
+    company_block = (
+        f"<b>{company['company_name']}</b><br/>{company['address']}<br/>"
+        f"Tel.: {company['phone']}<br/>E-mail: {company['email']}<br/>AdÃ³szÃ¡m: {company['tax_number']}"
+    )
+    customer_block = (
+        f"<b>ÃgyfÃ©l</b><br/>{quote['client_name']}<br/>Tel.: {quote['phone']}<br/>"
+        f"CÃ­m: {quote['address']}"
+    )
+    info = Table([[Paragraph(company_block, normal), Paragraph(customer_block, normal)]], colWidths=[90*mm, 75*mm])
+    info.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "TOP"), ("BOX", (0,0), (-1,-1), .5, colors.grey),
+                              ("INNERGRID", (0,0), (-1,-1), .25, colors.lightgrey), ("PADDING", (0,0), (-1,-1), 7)]))
+    story += [info, Spacer(1, 8)]
+    story.append(Paragraph(f"AjÃ¡nlatszÃ¡m: <b>{quote['quote_number']}</b> &nbsp;&nbsp; DÃ¡tum: {quote['created_at']}", normal))
+    story.append(Spacer(1, 8))
+    rows = [
+        [Paragraph("Munka", normal), Paragraph("MennyisÃ©g", normal), Paragraph("MunkadÃ­j", normal), Paragraph("Anyag", normal), Paragraph("Ãsszesen", normal)],
+        [Paragraph(quote['work'], normal), Paragraph(str(quote['quantity']), normal), Paragraph(money(quote['price']), right),
+         Paragraph(money(quote['material']), right), Paragraph(money(quote['total']), right)],
+    ]
+    table = Table(rows, colWidths=[60*mm, 25*mm, 27*mm, 27*mm, 27*mm], repeatRows=1)
+    table.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), colors.HexColor("#eeeeee")),
+                               ("GRID", (0,0), (-1,-1), .5, colors.grey), ("VALIGN", (0,0), (-1,-1), "TOP"),
+                               ("PADDING", (0,0), (-1,-1), 6)]))
+    story += [table, Spacer(1, 10), Paragraph(f"<b>VÃ©gÃ¶sszeg: {money(quote['total'])}</b>", ParagraphStyle("total", parent=right, fontName=font, fontSize=13)),
+              Spacer(1, 8), Paragraph(f"Tervezett hatÃ¡ridÅ: <b>{quote['deadline']}</b>", normal), Spacer(1, 18),
+              Paragraph("Az ajÃ¡nlat a megadott adatok alapjÃ¡n kÃ©szÃ¼lt. A vÃ©gleges munkadÃ­j a helyszÃ­ni felmÃ©rÃ©s Ã©s az esetleges vÃ¡ltoztatÃ¡sok fÃ¼ggvÃ©nyÃ©ben mÃ³dosulhat.", normal)]
+    doc.build(story)
 
-async def company(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    if not await require_subscription(
-        update,
-        context
-    ):
-        return
-
-    user_id = update.effective_user.id
-
-    row = get_company_data(user_id)
-
-    if row:
-
-        company_name, phone, email, address, tax_number = row
-
-        text = (
-            "⚙️ Cégadatok\n\n"
-
-            f"🏢 Cégnév: {company_name or '-'}\n"
-            f"📞 Telefonszám: {phone or '-'}\n"
-            f"📧 E-mail: {email or '-'}\n"
-            f"🏠 Cím: {address or '-'}\n"
-            f"🧾 Adószám: {tax_number or '-'}\n\n"
-
-            "💾 Az adatok automatikusan mentve vannak.\n"
-            "📄 Ezek később bekerülnek a PDF árajánlatba."
-        )
-
-    else:
-
-        text = (
-            "⚙️ Cégadatok\n\n"
-
-            "Még nincsenek megadva a vállalkozásod adatai.\n\n"
-
-            "Az összes adatot egyszerre add meg.\n\n"
-
-            "Például:\n\n"
-
-            "Cégnév: Minta Építő Kft.\n"
-            "Telefonszám: +36301234567\n"
-            "E-mail: info@pelda.hu\n"
-            "Cím: 5000 Szolnok, Kossuth Lajos út 10.\n"
-            "Adószám: 12345678-2-16\n\n"
-
-            "💾 A bot automatikusan elmenti az adatokat."
-        )
-
-    keyboard = InlineKeyboardMarkup([
-
-        [
-            InlineKeyboardButton(
-                "✏️ Cégadatok megadása / módosítása",
-                callback_data="company_edit"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "⬅️ Főmenü",
-                callback_data="back_menu"
-            )
-        ],
+# -------------------- KEYBOARDS --------------------
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("ð Ãj Ã¡rajÃ¡nlat", callback_data="new_quote")],
+        [InlineKeyboardButton("ð¥ Ãgyfeleim", callback_data="clients"), InlineKeyboardButton("ð AjÃ¡nlataim", callback_data="quotes")],
+        [InlineKeyboardButton("ð¤ AI SegÃ­tÅ", callback_data="ai_help")],
+        [InlineKeyboardButton("âï¸ CÃ©gadatok", callback_data="company")],
+        [InlineKeyboardButton("ð³ ElÅfizetÃ©sem", callback_data="subscription")],
+        [InlineKeyboardButton("ð SegÃ­tsÃ©g", callback_data="help")],
     ])
 
-    await query.edit_message_text(
-        text,
-        reply_markup=keyboard
-    )
+
+def back_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("â¬ï¸ FÅmenÃ¼", callback_data="menu")]])
 
 
-# ============================================================
-# CÉGADATOK SZERKESZTÉSE
-# ============================================================
+def cancel_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("â MegszakÃ­tÃ¡s", callback_data="cancel")]])
 
-async def company_edit(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    if not await require_subscription(
-        update,
-        context
-    ):
-        return
-
+# -------------------- START / MENU --------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
+    await update.message.reply_text(
+        "ð¤ <b>AI ÃrajÃ¡nlat Pro</b>\n\nKÃ©szÃ­ts professzionÃ¡lis Ã¡rajÃ¡nlatokat gyorsan Ã©s egyszerÅ±en.",
+        parse_mode="HTML", reply_markup=main_keyboard())
 
-    context.user_data["company_step"] = True
+async def menu_callback(update, context):
+    q = update.callback_query; await q.answer(); context.user_data.clear()
+    await q.edit_message_text("ð¤ <b>AI ÃrajÃ¡nlat Pro</b>\n\nVÃ¡lassz egy funkciÃ³t:", parse_mode="HTML", reply_markup=main_keyboard())
 
-    await query.edit_message_text(
+async def cancel(update, context):
+    context.user_data.clear()
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text("â MegszakÃ­tva.", reply_markup=main_keyboard())
+    else:
+        await update.message.reply_text("â MegszakÃ­tva.", reply_markup=main_keyboard())
 
-        "✏️ Cégadatok megadása\n\n"
+# -------------------- COMPANY --------------------
+async def company_menu(update, context):
+    if not await require_subscription(update, context): return
+    q = update.callback_query; await q.answer()
+    data = get_company_data(update.effective_user.id)
+    if data:
+        text = "âï¸ <b>CÃ©gadatok</b>\n\n" + company_display(data)
+        kb = [[InlineKeyboardButton("âï¸ MÃ³dosÃ­tÃ¡s", callback_data="company_edit")], [InlineKeyboardButton("â¬ï¸ FÅmenÃ¼", callback_data="menu")]]
+    else:
+        text = "âï¸ <b>CÃ©gadatok</b>\n\nMÃ©g nincsenek elmentett cÃ©gadataid.\n\nKÃ¼ldd el egy Ã¼zenetben az alÃ¡bbi formÃ¡ban:\n\nCÃ©gnÃ©v: ...\nTelefonszÃ¡m: ...\nE-mail: ...\nCÃ­m: ...\nAdÃ³szÃ¡m: ..."
+        kb = [[InlineKeyboardButton("â¬ï¸ FÅmenÃ¼", callback_data="menu")]]
+    await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
-        "Írd be az összes adatot EGYETLEN üzenetben.\n\n"
+async def company_edit(update, context):
+    q = update.callback_query; await q.answer()
+    context.user_data["state"] = "company"
+    await q.edit_message_text("âï¸ KÃ¼ldd el a cÃ©gadataidat egyetlen Ã¼zenetben:\n\nCÃ©gnÃ©v: ...\nTelefonszÃ¡m: ...\nE-mail: ...\nCÃ­m: ...\nAdÃ³szÃ¡m: ...", reply_markup=cancel_keyboard())
 
-        "Másold ezt a mintát és töltsd ki:\n\n"
+# -------------------- QUOTE FLOW --------------------
+QUOTE_STEPS = ["name", "phone", "address", "work", "quantity", "price", "material", "deadline"]
+PROMPTS = {
+    "name": "1/8 ð¤ ÃgyfÃ©l neve:",
+    "phone": "2/8 ð TelefonszÃ¡m:",
+    "address": "3/8 ð  ÃgyfÃ©l cÃ­me:",
+    "work": "4/8 ð ï¸ Milyen munkÃ¡ra kÃ©szÃ¼l az ajÃ¡nlat?",
+    "quantity": "5/8 ð MennyisÃ©g (pl. 80 mÂ²):",
+    "price": "6/8 ð° MunkadÃ­j (Ft):",
+    "material": "7/8 ð§± AnyagkÃ¶ltsÃ©g (Ft):",
+    "deadline": "8/8 ð HatÃ¡ridÅ (pl. 2026. oktÃ³ber 15.):",
+}
 
-        "Cégnév: Minta Építő Kft.\n"
-        "Telefonszám: +36301234567\n"
-        "E-mail: info@pelda.hu\n"
-        "Cím: 5000 Szolnok, Kossuth Lajos út 10.\n"
-        "Adószám: 12345678-2-16\n\n"
+async def new_quote(update, context):
+    if not await require_subscription(update, context): return
+    q = update.callback_query; await q.answer()
+    context.user_data.clear(); context.user_data["state"] = "quote:name"
+    await q.edit_message_text(PROMPTS["name"], reply_markup=cancel_keyboard())
 
-        "💾 A bot automatikusan elmenti.\n"
-        "✏️ Később ugyanígy módosíthatod."
-    )
-
-
-# ============================================================
-# ÁRAJÁNLAT + CÉGADATOK SZÖVEGES BEVITEL
-# ============================================================
-
-async def handle_text(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not update.message:
-        return
-
-    if not update.message.text:
-        return
-
+async def handle_quote_text(update, context, state):
     text = update.message.text.strip()
-
-    # ========================================================
-    # CÉGADATOK
-    # ========================================================
-
-    if context.user_data.get("company_step"):
-
-        user_id = update.effective_user.id
-
-        data = parse_company_data(text)
-
-        missing = []
-
-        if not data["company_name"]:
-            missing.append("🏢 Cégnév")
-
-        if not data["phone"]:
-            missing.append("📞 Telefonszám")
-
-        if not data["email"]:
-            missing.append("📧 E-mail")
-
-        if not data["address"]:
-            missing.append("🏠 Cím")
-
-        if not data["tax_number"]:
-            missing.append("🧾 Adószám")
-
-        if missing:
-
-            await update.message.reply_text(
-
-                "⚠️ Nem találtam meg minden adatot.\n\n"
-
-                "Hiányzik:\n"
-                + "\n".join(missing)
-                + "\n\n"
-
-                "Kérlek, küldd el újra EGYETLEN üzenetben "
-                "ebben a formában:\n\n"
-
-                "Cégnév: ...\n"
-                "Telefonszám: ...\n"
-                "E-mail: ...\n"
-                "Cím: ...\n"
-                "Adószám: ..."
-            )
-
-            return
-
-        save_company_data(
-            user_id,
-            data
-        )
-
-        context.user_data.clear()
-
-        await update.message.reply_text(
-
-            "✅ Cégadatok sikeresen elmentve!\n\n"
-
-            "🏢 Cégnév: "
-            + data["company_name"] + "\n"
-
-            "📞 Telefonszám: "
-            + data["phone"] + "\n"
-
-            "📧 E-mail: "
-            + data["email"] + "\n"
-
-            "🏠 Cím: "
-            + data["address"] + "\n"
-
-            "🧾 Adószám: "
-            + data["tax_number"] + "\n\n"
-
-            "💾 Az adatok megmaradnak.\n"
-            "📄 A későbbi PDF árajánlatokban "
-            "automatikusan felhasználhatók.",
-
-            reply_markup=main_keyboard()
-        )
-
-        return
-
-    # ========================================================
-    # ÁRAJÁNLAT
-    # ========================================================
-
-    step = context.user_data.get("quote_step")
-
-    if not step:
-        return
-
-
-    # 1. NÉV
-    if step == 1:
-
-        context.user_data["name"] = text
-        context.user_data["quote_step"] = 2
-
-        await update.message.reply_text(
-
-            "2/8\n"
-            "📞 Írd be az ügyfél telefonszámát:"
-        )
-
-        return
-
-
-    # 2. TELEFON
-    if step == 2:
-
-        context.user_data["phone"] = text
-        context.user_data["quote_step"] = 3
-
-        await update.message.reply_text(
-
-            "3/8\n"
-            "🏠 Írd be a munkavégzés címét:"
-        )
-
-        return
-
-
-    # 3. CÍM
-    if step == 3:
-
-        context.user_data["address"] = text
-        context.user_data["quote_step"] = 4
-
-        await update.message.reply_text(
-
-            "4/8\n"
-            "🔨 Milyen munkát szeretne az ügyfél?"
-        )
-
-        return
-
-
-    # 4. MUNKA
-    if step == 4:
-
-        context.user_data["work"] = text
-        context.user_data["quote_step"] = 5
-
-        await update.message.reply_text(
-
-            "5/8\n"
-            "📐 Add meg a mennyiséget.\n\n"
-
-            "Például:\n"
-            "80 m²\n"
-            "5 db\n"
-            "120 folyóméter\n\n"
-
-            "Ha nincs mennyiség, írd: nincs"
-        )
-
-        return
-
-
-    # 5. MENNYISÉG
-    if step == 5:
-
-        context.user_data["quantity"] = text
-        context.user_data["quote_step"] = 6
-
-        await update.message.reply_text(
-
-            "6/8\n"
-            "💰 Add meg a munkadíjat forintban:"
-        )
-
-        return
-
-
-    # 6. MUNKADÍJ
-    if step == 6:
-
-        context.user_data["price"] = text
-        context.user_data["quote_step"] = 7
-
-        await update.message.reply_text(
-
-            "7/8\n"
-            "🧱 Add meg az anyagköltséget forintban.\n\n"
-
-            "Ha nincs anyagköltség, írd: 0"
-        )
-
-        return
-
-
-    # 7. ANYAG
-    if step == 7:
-
-        context.user_data["material"] = text
-        context.user_data["quote_step"] = 8
-
-        await update.message.reply_text(
-
-            "8/8\n"
-            "📅 Mikorra vállalható a munka?\n\n"
-
-            "Például:\n"
-            "2026. október 10."
-        )
-
-        return
-
-
-    # 8. HATÁRIDŐ
-    if step == 8:
-
-        context.user_data["deadline"] = text
-
-        user_id = update.effective_user.id
-
-        data = context.user_data
-
-        if not get_active_subscription(user_id):
-
-            context.user_data.clear()
-
-            await update.message.reply_text(
-
-                "🔒 Az előfizetésed lejárt vagy nem aktív.\n\n"
-
-                "Az árajánlat mentéséhez aktív "
-                "előfizetés szükséges.",
-
-                reply_markup=main_keyboard()
-            )
-
-            return
-
-        conn = sqlite3.connect(DB_FILE)
-
-        # ÜGYFÉL MENTÉSE
-        conn.execute(
-
-            """
-            INSERT INTO clients
-            (user_id, name, phone, address, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-
-            (
-                user_id,
-                data["name"],
-                data["phone"],
-                data["address"],
-                datetime.now().isoformat()
-            )
-        )
-
-        # AJÁNLAT MENTÉSE
-        conn.execute(
-
-            """
-            INSERT INTO quotes
-            (
-                user_id,
-                client_name,
-                phone,
-                address,
-                work,
-                quantity,
-                price,
-                material,
-                deadline,
-                created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-
-            (
-                user_id,
-                data["name"],
-                data["phone"],
-                data["address"],
-                data["work"],
-                data["quantity"],
-                data["price"],
-                data["material"],
-                data["deadline"],
-                datetime.now().isoformat()
-            )
-        )
-
-        conn.commit()
-        conn.close()
-
-        quote = (
-
-            "📋 ÁRAJÁNLAT\n\n"
-
-            f"👤 Ügyfél: {data['name']}\n"
-            f"📞 Telefon: {data['phone']}\n"
-            f"🏠 Munkavégzés helye: {data['address']}\n\n"
-
-            f"🔨 Munka: {data['work']}\n"
-            f"📐 Mennyiség: {data['quantity']}\n"
-
-            f"💰 Munkadíj: {data['price']} Ft\n"
-            f"🧱 Anyagköltség: {data['material']} Ft\n"
-
-            f"📅 Határidő: {data['deadline']}\n\n"
-
-            "━━━━━━━━━━━━━━━━\n"
-
-            "AI Árajánlat Pro"
-        )
-
-        context.user_data.clear()
-
-        await update.message.reply_text(
-
-            "✅ Az árajánlat elkészült!\n\n"
-
-            + quote,
-
-            reply_markup=main_keyboard()
-        )
-
-
-# ============================================================
-# ÜGYFELEIM
-# ============================================================
-
-async def clients(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    if not await require_subscription(
-        update,
-        context
-    ):
-        return
-
-    user_id = update.effective_user.id
-
-    conn = sqlite3.connect(DB_FILE)
-
-    rows = conn.execute(
-
-        """
-        SELECT name, phone, address
-        FROM clients
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT 20
-        """,
-
-        (user_id,)
-    ).fetchall()
-
-    conn.close()
-
-    if not rows:
-
-        text = (
-            "👥 Ügyfeleim\n\n"
-            "Még nincs mentett ügyfeled."
-        )
-
-    else:
-
-        text = "👥 Ügyfeleim\n\n"
-
-        for number, row in enumerate(rows, 1):
-
-            text += (
-                f"{number}. {row[0]}\n"
-                f"📞 {row[1]}\n"
-                f"🏠 {row[2]}\n\n"
-            )
-
-    await query.edit_message_text(
-        text,
-        reply_markup=main_keyboard()
-    )
-
-
-# ============================================================
-# AJÁNLATAIM
-# ============================================================
-
-async def quotes(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    if not await require_subscription(
-        update,
-        context
-    ):
-        return
-
-    user_id = update.effective_user.id
-
-    conn = sqlite3.connect(DB_FILE)
-
-    rows = conn.execute(
-
-        """
-        SELECT client_name, work, price, material
-        FROM quotes
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT 20
-        """,
-
-        (user_id,)
-    ).fetchall()
-
-    conn.close()
-
-    if not rows:
-
-        text = (
-            "📋 Ajánlataim\n\n"
-            "Még nincs elkészített ajánlatod."
-        )
-
-    else:
-
-        text = "📋 Ajánlataim\n\n"
-
-        for number, row in enumerate(rows, 1):
-
-            text += (
-                f"{number}. {row[0]}\n"
-                f"🔨 {row[1]}\n"
-                f"💰 Munkadíj: {row[2]} Ft\n"
-                f"🧱 Anyag: {row[3]} Ft\n\n"
-            )
-
-    await query.edit_message_text(
-        text,
-        reply_markup=main_keyboard()
-    )
-
-
-# ============================================================
-# AI SEGÍTŐ
-# ============================================================
-
-async def ai_helper(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    if not await require_subscription(
-        update,
-        context
-    ):
-        return
-
-    await query.edit_message_text(
-
-        "🤖 AI Segítő\n\n"
-
-        "Hamarosan itt kérhetsz segítséget az ajánlatok "
-        "megfogalmazásához.\n\n"
-
-        "Például:\n"
-
-        "„Írj egy professzionális ajánlatot "
-        "egy lakás festésére.”",
-
-        reply_markup=main_keyboard()
-    )
-
-
-# ============================================================
-# ELŐFIZETÉS MENÜ
-# ============================================================
-
-async def subscription(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    keyboard = InlineKeyboardMarkup([
-
-        [
-            InlineKeyboardButton(
-                "🔵 PRO – 6 500 Ft / 7 nap",
-                callback_data="buy_pro"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🟣 PRO+ – 20 000 Ft / hó",
-                callback_data="buy_pro_plus"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "📊 Saját előfizetésem",
-                callback_data="subscription_status"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "⬅️ Vissza",
-                callback_data="back_menu"
-            )
-        ],
-    ])
-
-    await query.edit_message_text(
-
-        "💳 AI Árajánlat Pro előfizetés\n\n"
-
-        "🔵 PRO\n"
-        "6 500 Ft / 7 nap\n"
-        "⭐ 1 000 Stars\n\n"
-
-        "🟣 PRO+\n"
-        "20 000 Ft / hó\n"
-        "⭐ 3 000 Stars\n\n"
-
-        "Válaszd ki a csomagot:",
-
-        reply_markup=keyboard
-    )
-
-
-# ============================================================
-# PRO VÁSÁRLÁS
-# ============================================================
-
-async def buy_pro(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    await context.bot.send_invoice(
-
-        chat_id=update.effective_chat.id,
-
-        title="AI Árajánlat Pro",
-
-        description=(
-            "PRO hozzáférés 7 napra. "
-            "Árajánlatkészítés, ügyfél- és ajánlatkezelés."
-        ),
-
-        payload="PRO_7_DAYS",
-
-        provider_token="",
-
-        currency="XTR",
-
-        prices=[
-            LabeledPrice(
-                "PRO – 7 nap",
-                PRO_STARS
-            )
-        ],
-    )
-
-
-# ============================================================
-# PRO+ VÁSÁRLÁS
-# ============================================================
-
-async def buy_pro_plus(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    await context.bot.send_invoice(
-
-        chat_id=update.effective_chat.id,
-
-        title="AI Árajánlat Pro+",
-
-        description=(
-            "PRO+ havi hozzáférés. "
-            "Árajánlatkészítés, ügyfél- és ajánlatkezelés."
-        ),
-
-        payload="PRO_PLUS_MONTHLY",
-
-        provider_token="",
-
-        currency="XTR",
-
-        prices=[
-            LabeledPrice(
-                "PRO+ – 30 nap",
-                PRO_PLUS_STARS
-            )
-        ],
-
-        subscription_period=SUBSCRIPTION_PERIOD
-    )
-
-
-# ============================================================
-# ELŐFIZETÉS ÁLLAPOTA
-# ============================================================
-
-async def subscription_status(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    user_id = update.effective_user.id
-
-    row = get_active_subscription(user_id)
-
-    if not row:
-
-        text = (
-            "💳 Előfizetésem\n\n"
-            "❌ Nincs aktív előfizetésed.\n\n"
-            "Válassz egy csomagot a használathoz."
-        )
-
-    else:
-
-        plan, stars, expires_at, recurring = row
-
+    field = state.split(":", 1)[1]
+    if field == "price" or field == "material":
         try:
-            expires = datetime.fromisoformat(expires_at)
-
-            formatted_date = expires.strftime(
-                "%Y.%m.%d %H:%M"
-            )
-
+            value = parse_number(text)
         except Exception:
-
-            formatted_date = expires_at
-
-        text = (
-
-            "💳 Előfizetésem\n\n"
-
-            f"📦 Csomag: {plan}\n"
-            f"⭐ Fizetett Stars: {stars}\n"
-            f"📅 Érvényes eddig: {formatted_date}\n"
-        )
-
-        if recurring:
-
-            text += (
-                "\n🔄 Automatikusan megújuló "
-                "előfizetés."
-            )
-
-        else:
-
-            text += (
-                "\n📌 Egyszeri 7 napos "
-                "hozzáférés."
-            )
-
-    keyboard = InlineKeyboardMarkup([
-
-        [
-            InlineKeyboardButton(
-                "🛒 Csomagok",
-                callback_data="subscription"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "⬅️ Vissza",
-                callback_data="back_menu"
-            )
-        ],
-    ])
-
-    await query.edit_message_text(
-        text,
-        reply_markup=keyboard
-    )
-
-
-# ============================================================
-# PRE-CHECKOUT
-# ============================================================
-
-async def precheckout_callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.pre_checkout_query
-
-    await query.answer(ok=True)
-
-
-# ============================================================
-# SIKERES FIZETÉS
-# ============================================================
-
-async def successful_payment(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    payment = update.message.successful_payment
-
-    user_id = update.effective_user.id
-
-    payload = payment.invoice_payload
-
-    stars = payment.total_amount
-
-    charge_id = payment.telegram_payment_charge_id
-
-    now = datetime.now()
-
-    if payload == "PRO_7_DAYS":
-
-        plan = "PRO"
-
-        expires = now + timedelta(
-            days=PRO_DAYS
-        )
-
-        recurring = 0
-
-    elif payload == "PRO_PLUS_MONTHLY":
-
-        plan = "PRO+"
-
-        if payment.subscription_expiration_date:
-
-            expires = payment.subscription_expiration_date
-
-        else:
-
-            expires = now + timedelta(
-                days=PRO_PLUS_DAYS
-            )
-
-        recurring = 1
-
+            await update.message.reply_text("â ï¸ Ãrj be Ã©rvÃ©nyes Ã¶sszeget, pÃ©ldÃ¡ul: 250000", reply_markup=cancel_keyboard()); return
+        context.user_data[field] = value
     else:
-
-        await update.message.reply_text(
-            "⚠️ Ismeretlen fizetési csomag."
-        )
-
+        context.user_data[field] = text
+    idx = QUOTE_STEPS.index(field)
+    if idx < len(QUOTE_STEPS)-1:
+        nxt = QUOTE_STEPS[idx+1]
+        context.user_data["state"] = "quote:" + nxt
+        await update.message.reply_text(PROMPTS[nxt], reply_markup=cancel_keyboard())
         return
+    await finish_quote(update, context)
 
-    conn = sqlite3.connect(DB_FILE)
-
-    conn.execute(
-
-        """
-        INSERT INTO subscriptions
-        (
-            user_id,
-            plan,
-            stars,
-            expires_at,
-            is_recurring,
-            charge_id,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-
-        (
-            user_id,
-            plan,
-            stars,
-            expires.isoformat(),
-            recurring,
-            charge_id,
-            now.isoformat()
-        )
-    )
-
-    conn.commit()
-    conn.close()
-
-    if recurring:
-
-        renewal_text = (
-            "🔄 Az előfizetés automatikusan megújul."
-        )
-
-    else:
-
-        renewal_text = (
-            "📅 A hozzáférés 7 napig aktív."
-        )
-
-    await update.message.reply_text(
-
-        "🎉 Sikeres fizetés!\n\n"
-
-        f"📦 Csomag: {plan}\n"
-        f"⭐ Fizetett: {stars} Stars\n"
-        f"📅 Érvényes eddig: "
-        f"{expires.strftime('%Y.%m.%d %H:%M')}\n\n"
-
-        f"{renewal_text}\n\n"
-
-        "✅ Az előfizetésed aktiválva lett.",
-
-        reply_markup=main_keyboard()
-    )
-
-
-# ============================================================
-# TERMS
-# ============================================================
-
-async def terms(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    await update.message.reply_text(
-
-        "📄 Általános feltételek\n\n"
-
-        "Az AI Árajánlat Pro digitális szolgáltatás.\n\n"
-
-        "A szolgáltatás Telegramon keresztül érhető el.\n"
-
-        "A vásárlás Telegram Stars használatával történik.\n\n"
-
-        "PRO: 7 napos hozzáférés.\n"
-
-        "PRO+: 30 napos, automatikusan megújuló "
-        "előfizetés.\n\n"
-
-        "A vásárlás előtt mindig ellenőrizd az "
-        "aktuális csomagot és az árat."
-    )
-
-
-# ============================================================
-# PAYMENT SUPPORT
-# ============================================================
-
-async def paysupport(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    await update.message.reply_text(
-
-        "🆘 Fizetési segítség\n\n"
-
-        "Ha problémád van a fizetéssel vagy "
-        "az előfizetéseddel, írj az "
-        "AI Árajánlat Pro ügyfélszolgálatának."
-    )
-
-
-# ============================================================
-# SEGÍTSÉG
-# ============================================================
-
-async def help_menu(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    await query.edit_message_text(
-
-        "🆘 Segítség\n\n"
-
-        "📝 Új árajánlat – új ajánlat készítése.\n"
-        "👥 Ügyfeleim – mentett ügyfelek.\n"
-        "📋 Ajánlataim – korábbi ajánlatok.\n"
-        "🤖 AI Segítő – AI segítség.\n"
-        "⚙️ Cégadatok – vállalkozási adatok.\n"
-        "💳 Előfizetés – PRO és PRO+.\n\n"
-
-        "/terms – feltételek\n"
-        "/paysupport – fizetési segítség",
-
-        reply_markup=main_keyboard()
-    )
-
-
-# ============================================================
-# VISSZA A FŐMENÜBE
-# ============================================================
-
-async def back_menu(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
+async def finish_quote(update, context):
+    uid = update.effective_user.id
+    if not get_active_subscription(uid):
+        context.user_data.clear(); await update.message.reply_text("ð Az elÅfizetÃ©sed lejÃ¡rt.", reply_markup=main_keyboard()); return
+    d = context.user_data
+    quote_number = next_quote_number(uid)
+    total = float(d["price"]) + float(d["material"])
+    created = datetime.now().strftime("%Y.%m.%d.")
+    conn = db()
+    conn.execute("INSERT INTO clients(user_id,name,phone,address,created_at) VALUES(?,?,?,?,?)",
+                 (uid,d["name"],d["phone"],d["address"],now_str()))
+    conn.execute("INSERT INTO quotes(user_id,client_name,phone,address,work,quantity,price,material,total,deadline,quote_number,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                 (uid,d["name"],d["phone"],d["address"],d["work"],d["quantity"],d["price"],d["material"],total,d["deadline"],quote_number,created))
+    quote_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.commit(); conn.close()
     context.user_data.clear()
+    text = (f"â <b>ÃrajÃ¡nlat elkÃ©szÃ¼lt</b>\n\nð¢ {quote_number}\nð¤ {d['name']}\nð {d['phone']}\nð  {d['address']}\n\n"
+            f"ð ï¸ {d['work']}\nð {d['quantity']}\nð° MunkadÃ­j: {money(d['price'])}\nð§± Anyag: {money(d['material'])}\n"
+            f"ðµ <b>VÃ©gÃ¶sszeg: {money(total)}</b>\nð HatÃ¡ridÅ: {d['deadline']}")
+    kb = [[InlineKeyboardButton("ð PDF elkÃ¼ldÃ©se", callback_data=f"pdf:{quote_id}")],
+          [InlineKeyboardButton("ð AjÃ¡nlataim", callback_data="quotes"), InlineKeyboardButton("â¬ï¸ FÅmenÃ¼", callback_data="menu")]]
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
-    await query.edit_message_text(
+# -------------------- CLIENTS --------------------
+async def clients_menu(update, context):
+    if not await require_subscription(update, context): return
+    q = update.callback_query; await q.answer()
+    uid = update.effective_user.id
+    conn = db(); rows = conn.execute("SELECT * FROM clients WHERE user_id=? ORDER BY id DESC LIMIT 20", (uid,)).fetchall(); conn.close()
+    if not rows:
+        await q.edit_message_text("ð¥ MÃ©g nincs mentett Ã¼gyfeled.", reply_markup=back_keyboard()); return
+    text = "ð¥ <b>Ãgyfeleim</b>\n\n" + "\n\n".join(f"<b>{r['name']}</b>\nð {r['phone']}\nð  {r['address']}" for r in rows)
+    await q.edit_message_text(text, parse_mode="HTML", reply_markup=back_keyboard())
 
-        "🤖 Főmenü",
+# -------------------- QUOTES --------------------
+async def quotes_menu(update, context):
+    if not await require_subscription(update, context): return
+    q = update.callback_query; await q.answer()
+    uid = update.effective_user.id
+    conn = db(); rows = conn.execute("SELECT * FROM quotes WHERE user_id=? ORDER BY id DESC LIMIT 20", (uid,)).fetchall(); conn.close()
+    if not rows:
+        await q.edit_message_text("ð MÃ©g nincs mentett ajÃ¡nlatod.", reply_markup=back_keyboard()); return
+    buttons = []
+    for r in rows:
+        buttons.append([InlineKeyboardButton(f"{r['quote_number']} â {r['client_name']}", callback_data=f"quote:{r['id']}")])
+    buttons.append([InlineKeyboardButton("â¬ï¸ FÅmenÃ¼", callback_data="menu")])
+    await q.edit_message_text("ð <b>AjÃ¡nlataim</b>\n\nVÃ¡lassz egy ajÃ¡nlatot:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
 
-        reply_markup=main_keyboard()
-    )
+async def quote_detail(update, context):
+    if not await require_subscription(update, context): return
+    q = update.callback_query; await q.answer()
+    qid = int(q.data.split(":")[1]); uid = update.effective_user.id
+    conn = db(); r = conn.execute("SELECT * FROM quotes WHERE id=? AND user_id=?", (qid,uid)).fetchone(); conn.close()
+    if not r:
+        await q.edit_message_text("â Az ajÃ¡nlat nem talÃ¡lhatÃ³.", reply_markup=back_keyboard()); return
+    text = (f"ð <b>{r['quote_number']}</b>\n\nð¤ {r['client_name']}\nð {r['phone']}\nð  {r['address']}\n\n"
+            f"ð ï¸ {r['work']}\nð {r['quantity']}\nð° MunkadÃ­j: {money(r['price'])}\nð§± Anyag: {money(r['material'])}\n"
+            f"ðµ <b>Ãsszesen: {money(r['total'])}</b>\nð HatÃ¡ridÅ: {r['deadline']}\nð KÃ©szÃ¼lt: {r['created_at']}")
+    kb = [[InlineKeyboardButton("ð PDF elkÃ¼ldÃ©se", callback_data=f"pdf:{qid}")],
+          [InlineKeyboardButton("â¬ï¸ AjÃ¡nlataim", callback_data="quotes")]]
+    await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
+async def send_pdf(update, context):
+    if not await require_subscription(update, context): return
+    q = update.callback_query; await q.answer("PDF kÃ©szÃ¼l...")
+    qid = int(q.data.split(":")[1]); uid = update.effective_user.id
+    conn = db(); r = conn.execute("SELECT * FROM quotes WHERE id=? AND user_id=?", (qid,uid)).fetchone(); conn.close()
+    if not r:
+        await q.message.reply_text("â Az ajÃ¡nlat nem talÃ¡lhatÃ³."); return
+    company = get_company_data(uid)
+    if not company:
+        await q.message.reply_text("â ï¸ ElÅbb tÃ¶ltsd ki a CÃ©gadatokat, hogy a PDF fejlÃ©cÃ©ben megjelenhessenek.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("âï¸ CÃ©gadatok", callback_data="company")]])); return
+    path = f"/tmp/{r['quote_number']}.pdf"
+    try:
+        create_pdf(dict(r), company, path)
+        with open(path, "rb") as f:
+            await q.message.reply_document(document=f, filename=f"{r['quote_number']}.pdf", caption=f"ð ÃrajÃ¡nlat: {r['quote_number']}")
+    except Exception as e:
+        await q.message.reply_text(f"â A PDF elkÃ©szÃ­tÃ©se nem sikerÃ¼lt: {e}")
+    finally:
+        try: os.remove(path)
+        except OSError: pass
 
-# ============================================================
-# MAIN
-# ============================================================
+# -------------------- AI HELPER --------------------
+async def ai_help(update, context):
+    if not await require_subscription(update, context): return
+    q = update.callback_query; await q.answer()
+    context.user_data["state"] = "ai"
+    await q.edit_message_text(
+        "ð¤ <b>AI SegÃ­tÅ</b>\n\nÃrd le, miben segÃ­tsek az Ã¡rajÃ¡nlatoddal kapcsolatban.\n\n"
+        "PÃ©ldÃ¡ul: âMennyit kÃ©rjek 80 mÂ² tisztasÃ¡gi festÃ©sÃ©rt?â vagy âÃrj rÃ¶vid munkaleÃ­rÃ¡st festÃ©shez.â",
+        parse_mode="HTML", reply_markup=cancel_keyboard())
 
+async def ai_answer(update, context):
+    # Local helper that works without an external API. It intentionally does not invent live market prices.
+    text = update.message.text.strip()
+    low = text.lower()
+    if any(x in low for x in ["Ã¡r", "mennyi", "mennyit", "ft"]):
+        answer = ("ð¤ ÃrajÃ¡nlati tipp:\n\nA pontos munkadÃ­jat a terÃ¼let, felÃ¼let Ã¡llapota, rÃ©tegrend, javÃ­tÃ¡sok, "
+                  "anyagminÅsÃ©g Ã©s helyszÃ­n alapjÃ¡n Ã©rdemes meghatÃ¡rozni. Ha megadod a mÂ²-t, a munka tÃ­pusÃ¡t Ã©s "
+                  "az anyagkÃ¶ltsÃ©get, kiszÃ¡molom a vÃ©gÃ¶sszeget az ajÃ¡nlatodhoz.")
+    elif "leÃ­rÃ¡s" in low or "munkaleÃ­rÃ¡s" in low:
+        answer = "ð¤ MunkaleÃ­rÃ¡s minta:\n\nA munkaterÃ¼let elÅkÃ©szÃ­tÃ©se, szÃ¼ksÃ©ges javÃ­tÃ¡sok elvÃ©gzÃ©se, alapozÃ¡s Ã©s a megadott felÃ¼letek szakszerÅ± festÃ©se, majd a munkaterÃ¼let tisztÃ¡n Ã¡tadÃ¡sa."
+    else:
+        answer = "ð¤ Ãrd le konkrÃ©tan, mit szeretnÃ©l kiszÃ¡molni vagy megfogalmazni, Ã©s segÃ­tek az ajÃ¡nlat elkÃ©szÃ­tÃ©sÃ©ben."
+    context.user_data.pop("state", None)
+    await update.message.reply_text(answer, reply_markup=main_keyboard())
+
+# -------------------- HELP / PAYMENTS --------------------
+async def help_menu(update, context):
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text(
+        "ð <b>SegÃ­tsÃ©g</b>\n\n"
+        "1. TÃ¶ltsd ki a CÃ©gadatokat.\n"
+        "2. AktÃ­v elÅfizetÃ©ssel kÃ©szÃ­ts Ãºj ajÃ¡nlatot.\n"
+        "3. Az elkÃ©szÃ¼lt ajÃ¡nlat elmentÅdik.\n"
+        "4. PDF-et kÃ¶zvetlenÃ¼l Telegramon kÃ©rhetsz.\n"
+        "5. A korÃ¡bbi ajÃ¡nlatok az AjÃ¡nlataim menÃ¼ben Ã©rhetÅk el.\n\n"
+        "A bot az adatokat SQLite adatbÃ¡zisban tÃ¡rolja.", parse_mode="HTML", reply_markup=back_keyboard())
+
+async def subscription_menu(update, context):
+    q = update.callback_query; await q.answer()
+    text = "ð³ <b>ElÅfizetÃ©s</b>\n\n" + subscription_text(update.effective_user.id) + "\n\nVÃ¡lassz csomagot:"
+    kb = [[InlineKeyboardButton("ðµ PRO â 7 nap", callback_data="buy_pro")],
+          [InlineKeyboardButton("ð£ PRO+ â 30 nap", callback_data="buy_plus")],
+          [InlineKeyboardButton("ð SajÃ¡t elÅfizetÃ©sem", callback_data="status")],
+          [InlineKeyboardButton("â¬ï¸ FÅmenÃ¼", callback_data="menu")]]
+    await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def buy_pro(update, context):
+    q = update.callback_query; await q.answer()
+    await context.bot.send_invoice(update.effective_chat.id, "AI ÃrajÃ¡nlat Pro â PRO", "7 napos hozzÃ¡fÃ©rÃ©s", "AI ÃrajÃ¡nlat Pro PRO", "", "XTR", [LabeledPrice("PRO â 7 nap", PRO_STARS)])
+
+async def buy_plus(update, context):
+    q = update.callback_query; await q.answer()
+    await context.bot.send_invoice(update.effective_chat.id, "AI ÃrajÃ¡nlat Pro â PRO+", "30 napos hozzÃ¡fÃ©rÃ©s", "AI ÃrajÃ¡nlat Pro PRO+", "", "XTR", [LabeledPrice("PRO+ â 30 nap", PRO_PLUS_STARS)], subscription_period=SUBSCRIPTION_PERIOD)
+
+async def precheckout(update, context):
+    await update.pre_checkout_query.answer(ok=True)
+
+async def successful_payment(update, context):
+    p = update.message.successful_payment
+    uid = update.effective_user.id
+    plan = "PRO+" if p.total_amount == PRO_PLUS_STARS else "PRO"
+    days = PRO_PLUS_DAYS if plan == "PRO+" else PRO_DAYS
+    expires = getattr(p, "subscription_expiration_date", None)
+    if expires:
+        try:
+            expires_dt = datetime.fromtimestamp(expires)
+        except Exception:
+            expires_dt = datetime.now() + timedelta(days=days)
+    else:
+        expires_dt = datetime.now() + timedelta(days=days)
+    recurring = 1 if plan == "PRO+" else 0
+    charge = getattr(p, "telegram_payment_charge_id", "")
+    conn = db()
+    conn.execute("INSERT INTO subscriptions(user_id,plan,stars,expires_at,is_recurring,charge_id,created_at) VALUES(?,?,?,?,?,?,?)",
+                 (uid,plan,p.total_amount,expires_dt.isoformat(),recurring,charge,now_str()))
+    conn.commit(); conn.close()
+    await update.message.reply_text(f"â Sikeres fizetÃ©s!\n\nð¦ {plan}\nð ÃrvÃ©nyes eddig: {expires_dt.strftime('%Y.%m.%d. %H:%M')}\n\nMost mÃ¡r hasznÃ¡lhatod az AI ÃrajÃ¡nlat Pro funkciÃ³it.", reply_markup=main_keyboard())
+
+async def status(update, context):
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text("ð <b>SajÃ¡t elÅfizetÃ©sem</b>\n\n" + subscription_text(update.effective_user.id), parse_mode="HTML", reply_markup=back_keyboard())
+
+async def terms(update, context):
+    await update.message.reply_text("ð FelhasznÃ¡lÃ¡si feltÃ©telek\n\nAz AI ÃrajÃ¡nlat Pro digitÃ¡lis szolgÃ¡ltatÃ¡s. A vÃ¡sÃ¡rlÃ¡s Telegram Stars hasznÃ¡latÃ¡val tÃ¶rtÃ©nik.")
+
+async def paysupport(update, context):
+    await update.message.reply_text("ð³ FizetÃ©si segÃ­tsÃ©g\n\nHa fizetÃ©si problÃ©mÃ¡d van, Ã­rd le pontosan, mi tÃ¶rtÃ©nt, Ã©s segÃ­tÃ¼nk a hiba azonosÃ­tÃ¡sÃ¡ban.")
+
+# -------------------- TEXT ROUTER --------------------
+async def text_handler(update, context):
+    if not update.message or not update.message.text:
+        return
+    state = context.user_data.get("state", "")
+    if state.startswith("quote:"):
+        if await require_subscription(update, context):
+            await handle_quote_text(update, context, state)
+        return
+    if state == "company":
+        if not await require_subscription(update, context): return
+        data = parse_company_data(update.message.text)
+        required = ["company_name", "phone", "email", "address", "tax_number"]
+        if any(not data.get(k) for k in required):
+            await update.message.reply_text("â ï¸ Minden mezÅ kÃ¶telezÅ. KÃ©rlek, Ã­gy kÃ¼ldd el:\n\nCÃ©gnÃ©v: ...\nTelefonszÃ¡m: ...\nE-mail: ...\nCÃ­m: ...\nAdÃ³szÃ¡m: ...", reply_markup=cancel_keyboard()); return
+        save_company_data(update.effective_user.id, data); context.user_data.clear()
+        await update.message.reply_text("â CÃ©gadatok elmentve!\n\n" + company_display(data), reply_markup=main_keyboard()); return
+    if state == "ai":
+        if await require_subscription(update, context): await ai_answer(update, context)
+        return
+    await update.message.reply_text("VÃ¡lassz egy funkciÃ³t a menÃ¼bÅl.", reply_markup=main_keyboard())
+
+# -------------------- CALLBACK ROUTER --------------------
+async def callback_router(update, context):
+    data = update.callback_query.data
+    if data == "menu": await menu_callback(update, context)
+    elif data == "cancel": await cancel(update, context)
+    elif data == "new_quote": await new_quote(update, context)
+    elif data == "clients": await clients_menu(update, context)
+    elif data == "quotes": await quotes_menu(update, context)
+    elif data.startswith("quote:"): await quote_detail(update, context)
+    elif data.startswith("pdf:"): await send_pdf(update, context)
+    elif data == "ai_help": await ai_help(update, context)
+    elif data == "company": await company_menu(update, context)
+    elif data == "company_edit": await company_edit(update, context)
+    elif data == "help": await help_menu(update, context)
+    elif data == "subscription": await subscription_menu(update, context)
+    elif data == "buy_pro": await buy_pro(update, context)
+    elif data == "buy_plus": await buy_plus(update, context)
+    elif data == "status": await status(update, context)
+
+# -------------------- MAIN --------------------
 def main():
-
     if not BOT_TOKEN:
-
-        raise RuntimeError(
-            "BOT_TOKEN nincs beállítva."
-        )
-
+        raise RuntimeError("BOT_TOKEN environment variable is missing")
     init_db()
-
-    threading.Thread(
-        target=run_web_server,
-        daemon=True
-    ).start()
-
-    app = (
-        Application
-        .builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
-    # ========================================================
-    # PARANCSOK
-    # ========================================================
-
-    app.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "menu",
-            menu
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "cancel",
-            cancel
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "terms",
-            terms
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "paysupport",
-            paysupport
-        )
-    )
-
-    # ========================================================
-    # ÁRAJÁNLAT
-    # ========================================================
-
-    app.add_handler(
-        CallbackQueryHandler(
-            new_quote,
-            pattern="^new_quote$"
-        )
-    )
-
-    # ========================================================
-    # ÜGYFELEK
-    # ========================================================
-
-    app.add_handler(
-        CallbackQueryHandler(
-            clients,
-            pattern="^clients$"
-        )
-    )
-
-    # ========================================================
-    # AJÁNLATOK
-    # ========================================================
-
-    app.add_handler(
-        CallbackQueryHandler(
-            quotes,
-            pattern="^quotes$"
-        )
-    )
-
-    # ========================================================
-    # AI
-    # ========================================================
-
-    app.add_handler(
-        CallbackQueryHandler(
-            ai_helper,
-            pattern="^ai$"
-        )
-    )
-
-    # ========================================================
-    # CÉGADATOK
-    # ========================================================
-
-    app.add_handler(
-        CallbackQueryHandler(
-            company,
-            pattern="^company$"
-        )
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            company_edit,
-            pattern="^company_edit$"
-        )
-    )
-
-    # ========================================================
-    # ELŐFIZETÉS
-    # ========================================================
-
-    app.add_handler(
-        CallbackQueryHandler(
-            subscription,
-            pattern="^subscription$"
-        )
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            buy_pro,
-            pattern="^buy_pro$"
-        )
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            buy_pro_plus,
-            pattern="^buy_pro_plus$"
-        )
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            subscription_status,
-            pattern="^subscription_status$"
-        )
-    )
-
-    # ========================================================
-    # VISSZA
-    # ========================================================
-
-    app.add_handler(
-        CallbackQueryHandler(
-            back_menu,
-            pattern="^back_menu$"
-        )
-    )
-
-    # ========================================================
-    # FIZETÉS
-    # ========================================================
-
-    app.add_handler(
-        PreCheckoutQueryHandler(
-            precheckout_callback
-        )
-    )
-
-    app.add_handler(
-        MessageHandler(
-            filters.SUCCESSFUL_PAYMENT,
-            successful_payment
-        )
-    )
-
-    # ========================================================
-    # SZÖVEGES ÜZENETEK
-    # ========================================================
-
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_text
-        )
-    )
-
-    # ========================================================
-    # INDÍTÁS
-    # ========================================================
-
-    app.run_polling()
-
+    threading.Thread(target=run_web_server, daemon=True).start()
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("terms", terms))
+    app.add_handler(CommandHandler("paysupport", paysupport))
+    app.add_handler(PreCheckoutQueryHandler(precheckout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+    app.add_handler(CallbackQueryHandler(callback_router))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    print("AI ÃrajÃ¡nlat Pro started")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
