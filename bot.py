@@ -31,11 +31,9 @@ DB_FILE = "arajanlat.db"
 PRO_STARS = 1000
 PRO_PLUS_STARS = 3000
 
-# Hozzáférési idők
 PRO_DAYS = 7
 PRO_PLUS_DAYS = 30
 
-# Telegram havi előfizetés
 SUBSCRIPTION_PERIOD = 2592000
 
 
@@ -47,16 +45,26 @@ class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.send_header(
+            "Content-type",
+            "text/plain; charset=utf-8"
+        )
         self.end_headers()
-        self.wfile.write(b"AI Arjanlat Pro is running!")
+        self.wfile.write(
+            b"AI Arjanlat Pro is running!"
+        )
 
     def log_message(self, format, *args):
         pass
 
 
 def run_web_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+
+    server = HTTPServer(
+        ("0.0.0.0", PORT),
+        HealthHandler
+    )
+
     server.serve_forever()
 
 
@@ -110,6 +118,80 @@ def init_db():
 
     conn.commit()
     conn.close()
+
+
+# ============================================================
+# AKTÍV ELŐFIZETÉS ELLENŐRZÉSE
+# ============================================================
+
+def get_active_subscription(user_id):
+
+    now = datetime.now().isoformat()
+
+    conn = sqlite3.connect(DB_FILE)
+
+    row = conn.execute(
+        """
+        SELECT plan, stars, expires_at, is_recurring
+        FROM subscriptions
+        WHERE user_id = ?
+        AND expires_at > ?
+        ORDER BY expires_at DESC
+        LIMIT 1
+        """,
+        (user_id, now)
+    ).fetchone()
+
+    conn.close()
+
+    return row
+
+
+async def require_subscription(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    user_id = update.effective_user.id
+
+    subscription = get_active_subscription(user_id)
+
+    if subscription:
+        return True
+
+    keyboard = InlineKeyboardMarkup([
+
+        [
+            InlineKeyboardButton(
+                "💳 Előfizetések",
+                callback_data="subscription"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "⬅️ Főmenü",
+                callback_data="back_menu"
+            )
+        ],
+    ])
+
+    message = update.callback_query.message
+
+    await message.edit_text(
+
+        "🔒 Ez a funkció aktív előfizetéshez kötött.\n\n"
+
+        "Az AI Árajánlat Pro használatához "
+        "válassz egy előfizetést.\n\n"
+
+        "🔵 PRO – 6 500 Ft / 7 nap\n"
+        "🟣 PRO+ – 20 000 Ft / hó",
+
+        reply_markup=keyboard
+    )
+
+    return False
 
 
 # ============================================================
@@ -175,7 +257,10 @@ def main_keyboard():
 # START
 # ============================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     context.user_data.clear()
 
@@ -192,7 +277,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     context.user_data.clear()
 
@@ -202,7 +290,10 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     context.user_data.clear()
 
@@ -226,6 +317,12 @@ async def new_quote(
     query = update.callback_query
 
     await query.answer()
+
+    if not await require_subscription(
+        update,
+        context
+    ):
+        return
 
     context.user_data.clear()
 
@@ -389,9 +486,24 @@ async def handle_text(
 
         data = context.user_data
 
+        # Biztonsági ellenőrzés még mentés előtt
+        if not get_active_subscription(user_id):
+
+            context.user_data.clear()
+
+            await update.message.reply_text(
+
+                "🔒 Az előfizetésed lejárt vagy nem aktív.\n\n"
+
+                "Az árajánlat mentéséhez aktív "
+                "előfizetés szükséges.",
+
+                reply_markup=main_keyboard()
+            )
+
+            return
 
         conn = sqlite3.connect(DB_FILE)
-
 
         # ÜGYFÉL MENTÉSE
         conn.execute(
@@ -410,7 +522,6 @@ async def handle_text(
                 datetime.now().isoformat()
             )
         )
-
 
         # AJÁNLAT MENTÉSE
         conn.execute(
@@ -446,10 +557,8 @@ async def handle_text(
             )
         )
 
-
         conn.commit()
         conn.close()
-
 
         quote = (
 
@@ -472,9 +581,7 @@ async def handle_text(
             "AI Árajánlat Pro"
         )
 
-
         context.user_data.clear()
-
 
         await update.message.reply_text(
 
@@ -499,6 +606,12 @@ async def clients(
 
     await query.answer()
 
+    if not await require_subscription(
+        update,
+        context
+    ):
+        return
+
     user_id = update.effective_user.id
 
     conn = sqlite3.connect(DB_FILE)
@@ -518,13 +631,10 @@ async def clients(
 
     conn.close()
 
-
     if not rows:
 
         text = (
-
             "👥 Ügyfeleim\n\n"
-
             "Még nincs mentett ügyfeled."
         )
 
@@ -535,17 +645,13 @@ async def clients(
         for number, row in enumerate(rows, 1):
 
             text += (
-
                 f"{number}. {row[0]}\n"
                 f"📞 {row[1]}\n"
                 f"🏠 {row[2]}\n\n"
             )
 
-
     await query.edit_message_text(
-
         text,
-
         reply_markup=main_keyboard()
     )
 
@@ -562,6 +668,12 @@ async def quotes(
     query = update.callback_query
 
     await query.answer()
+
+    if not await require_subscription(
+        update,
+        context
+    ):
+        return
 
     user_id = update.effective_user.id
 
@@ -582,13 +694,10 @@ async def quotes(
 
     conn.close()
 
-
     if not rows:
 
         text = (
-
             "📋 Ajánlataim\n\n"
-
             "Még nincs elkészített ajánlatod."
         )
 
@@ -599,18 +708,14 @@ async def quotes(
         for number, row in enumerate(rows, 1):
 
             text += (
-
                 f"{number}. {row[0]}\n"
                 f"🔨 {row[1]}\n"
                 f"💰 Munkadíj: {row[2]} Ft\n"
                 f"🧱 Anyag: {row[3]} Ft\n\n"
             )
 
-
     await query.edit_message_text(
-
         text,
-
         reply_markup=main_keyboard()
     )
 
@@ -627,6 +732,12 @@ async def ai_helper(
     query = update.callback_query
 
     await query.answer()
+
+    if not await require_subscription(
+        update,
+        context
+    ):
+        return
 
     await query.edit_message_text(
 
@@ -656,6 +767,12 @@ async def company(
     query = update.callback_query
 
     await query.answer()
+
+    if not await require_subscription(
+        update,
+        context
+    ):
+        return
 
     await query.edit_message_text(
 
@@ -688,7 +805,6 @@ async def subscription(
 
     await query.answer()
 
-
     keyboard = InlineKeyboardMarkup([
 
         [
@@ -707,12 +823,18 @@ async def subscription(
 
         [
             InlineKeyboardButton(
+                "📊 Saját előfizetésem",
+                callback_data="subscription_status"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
                 "⬅️ Vissza",
                 callback_data="back_menu"
             )
         ],
     ])
-
 
     await query.edit_message_text(
 
@@ -744,7 +866,6 @@ async def buy_pro(
     query = update.callback_query
 
     await query.answer()
-
 
     await context.bot.send_invoice(
 
@@ -784,7 +905,6 @@ async def buy_pro_plus(
     query = update.callback_query
 
     await query.answer()
-
 
     await context.bot.send_invoice(
 
@@ -829,34 +949,27 @@ async def subscription_status(
 
     user_id = update.effective_user.id
 
-    conn = sqlite3.connect(DB_FILE)
-
-    row = conn.execute(
-
-        """
-        SELECT plan, stars, expires_at, is_recurring
-        FROM subscriptions
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-
-        (user_id,)
-    ).fetchone()
-
-    conn.close()
-
+    row = get_active_subscription(user_id)
 
     if not row:
 
         text = (
             "💳 Előfizetésem\n\n"
-            "❌ Nincs aktív előfizetésed."
+            "❌ Nincs aktív előfizetésed.\n\n"
+            "Válassz egy csomagot a használathoz."
         )
 
     else:
 
         plan, stars, expires_at, recurring = row
+
+        try:
+            expires = datetime.fromisoformat(expires_at)
+            formatted_date = expires.strftime(
+                "%Y.%m.%d %H:%M"
+            )
+        except Exception:
+            formatted_date = expires_at
 
         text = (
 
@@ -864,15 +977,20 @@ async def subscription_status(
 
             f"📦 Csomag: {plan}\n"
             f"⭐ Fizetett Stars: {stars}\n"
-            f"📅 Érvényes eddig: {expires_at}\n"
+            f"📅 Érvényes eddig: {formatted_date}\n"
         )
 
         if recurring:
-            text += "\n🔄 Automatikusan megújuló előfizetés."
+            text += (
+                "\n🔄 Automatikusan megújuló "
+                "előfizetés."
+            )
 
         else:
-            text += "\n📌 Egyszeri 7 napos hozzáférés."
-
+            text += (
+                "\n📌 Egyszeri 7 napos "
+                "hozzáférés."
+            )
 
     keyboard = InlineKeyboardMarkup([
 
@@ -891,11 +1009,8 @@ async def subscription_status(
         ],
     ])
 
-
     await query.edit_message_text(
-
         text,
-
         reply_markup=keyboard
     )
 
@@ -933,7 +1048,6 @@ async def successful_payment(
 
     charge_id = payment.telegram_payment_charge_id
 
-
     now = datetime.now()
 
 
@@ -941,7 +1055,9 @@ async def successful_payment(
 
         plan = "PRO"
 
-        expires = now + timedelta(days=PRO_DAYS)
+        expires = now + timedelta(
+            days=PRO_DAYS
+        )
 
         recurring = 0
 
@@ -952,13 +1068,13 @@ async def successful_payment(
 
         if payment.subscription_expiration_date:
 
-            expires = datetime.fromtimestamp(
-                payment.subscription_expiration_date
-            )
+            expires = payment.subscription_expiration_date
 
         else:
 
-            expires = now + timedelta(days=PRO_PLUS_DAYS)
+            expires = now + timedelta(
+                days=PRO_PLUS_DAYS
+            )
 
         recurring = 1
 
@@ -973,7 +1089,6 @@ async def successful_payment(
 
 
     conn = sqlite3.connect(DB_FILE)
-
 
     conn.execute(
 
@@ -1002,9 +1117,7 @@ async def successful_payment(
         )
     )
 
-
     conn.commit()
-
     conn.close()
 
 
@@ -1099,7 +1212,6 @@ async def help_menu(
 
     await query.answer()
 
-
     await query.edit_message_text(
 
         "🆘 Segítség\n\n"
@@ -1151,15 +1263,12 @@ def main():
             "BOT_TOKEN nincs beállítva."
         )
 
-
     init_db()
-
 
     threading.Thread(
         target=run_web_server,
         daemon=True
     ).start()
-
 
     app = (
         Application
@@ -1323,7 +1432,6 @@ def main():
             precheckout_callback
         )
     )
-
 
     app.add_handler(
         MessageHandler(
