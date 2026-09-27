@@ -116,6 +116,22 @@ def init_db():
         )
     """)
 
+    # ========================================================
+    # CÉGADATOK
+    # ========================================================
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS company_data (
+            user_id INTEGER PRIMARY KEY,
+            company_name TEXT,
+            phone TEXT,
+            email TEXT,
+            address TEXT,
+            tax_number TEXT,
+            updated_at TEXT
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -338,7 +354,245 @@ async def new_quote(
 
 
 # ============================================================
-# ÁRAJÁNLAT ADATBEVITEL
+# CÉGADATOK - SEGÉDFÜGGVÉNY
+# ============================================================
+
+def parse_company_data(text):
+
+    data = {
+        "company_name": "",
+        "phone": "",
+        "email": "",
+        "address": "",
+        "tax_number": ""
+    }
+
+    lines = text.splitlines()
+
+    for line in lines:
+
+        if ":" not in line:
+            continue
+
+        key, value = line.split(":", 1)
+
+        key = key.strip().lower()
+        value = value.strip()
+
+        if key in ["cégnév", "cegnev"]:
+            data["company_name"] = value
+
+        elif key in [
+            "telefonszám",
+            "telefonszam",
+            "telefon"
+        ]:
+            data["phone"] = value
+
+        elif key in ["e-mail", "email", "e-mail cím", "email cím"]:
+            data["email"] = value
+
+        elif key in ["cím", "cim", "cégcím", "cegcim"]:
+            data["address"] = value
+
+        elif key in ["adószám", "adoszam"]:
+            data["tax_number"] = value
+
+    return data
+
+
+def get_company_data(user_id):
+
+    conn = sqlite3.connect(DB_FILE)
+
+    row = conn.execute(
+        """
+        SELECT
+            company_name,
+            phone,
+            email,
+            address,
+            tax_number
+        FROM company_data
+        WHERE user_id = ?
+        """,
+        (user_id,)
+    ).fetchone()
+
+    conn.close()
+
+    return row
+
+
+def save_company_data(user_id, data):
+
+    conn = sqlite3.connect(DB_FILE)
+
+    conn.execute(
+        """
+        INSERT INTO company_data
+        (
+            user_id,
+            company_name,
+            phone,
+            email,
+            address,
+            tax_number,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+
+        ON CONFLICT(user_id)
+        DO UPDATE SET
+            company_name = excluded.company_name,
+            phone = excluded.phone,
+            email = excluded.email,
+            address = excluded.address,
+            tax_number = excluded.tax_number,
+            updated_at = excluded.updated_at
+        """,
+        (
+            user_id,
+            data["company_name"],
+            data["phone"],
+            data["email"],
+            data["address"],
+            data["tax_number"],
+            datetime.now().isoformat()
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+
+# ============================================================
+# CÉGADATOK
+# ============================================================
+
+async def company(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    if not await require_subscription(
+        update,
+        context
+    ):
+        return
+
+    user_id = update.effective_user.id
+
+    row = get_company_data(user_id)
+
+    if row:
+
+        company_name, phone, email, address, tax_number = row
+
+        text = (
+            "⚙️ Cégadatok\n\n"
+
+            f"🏢 Cégnév: {company_name or '-'}\n"
+            f"📞 Telefonszám: {phone or '-'}\n"
+            f"📧 E-mail: {email or '-'}\n"
+            f"🏠 Cím: {address or '-'}\n"
+            f"🧾 Adószám: {tax_number or '-'}\n\n"
+
+            "💾 Az adatok automatikusan mentve vannak.\n"
+            "📄 Ezek később bekerülnek a PDF árajánlatba."
+        )
+
+    else:
+
+        text = (
+            "⚙️ Cégadatok\n\n"
+
+            "Még nincsenek megadva a vállalkozásod adatai.\n\n"
+
+            "Az összes adatot egyszerre add meg.\n\n"
+
+            "Például:\n\n"
+
+            "Cégnév: Minta Építő Kft.\n"
+            "Telefonszám: +36301234567\n"
+            "E-mail: info@pelda.hu\n"
+            "Cím: 5000 Szolnok, Kossuth Lajos út 10.\n"
+            "Adószám: 12345678-2-16\n\n"
+
+            "💾 A bot automatikusan elmenti az adatokat."
+        )
+
+    keyboard = InlineKeyboardMarkup([
+
+        [
+            InlineKeyboardButton(
+                "✏️ Cégadatok megadása / módosítása",
+                callback_data="company_edit"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "⬅️ Főmenü",
+                callback_data="back_menu"
+            )
+        ],
+    ])
+
+    await query.edit_message_text(
+        text,
+        reply_markup=keyboard
+    )
+
+
+# ============================================================
+# CÉGADATOK SZERKESZTÉSE
+# ============================================================
+
+async def company_edit(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    if not await require_subscription(
+        update,
+        context
+    ):
+        return
+
+    context.user_data.clear()
+
+    context.user_data["company_step"] = True
+
+    await query.edit_message_text(
+
+        "✏️ Cégadatok megadása\n\n"
+
+        "Írd be az összes adatot EGYETLEN üzenetben.\n\n"
+
+        "Másold ezt a mintát és töltsd ki:\n\n"
+
+        "Cégnév: Minta Építő Kft.\n"
+        "Telefonszám: +36301234567\n"
+        "E-mail: info@pelda.hu\n"
+        "Cím: 5000 Szolnok, Kossuth Lajos út 10.\n"
+        "Adószám: 12345678-2-16\n\n"
+
+        "💾 A bot automatikusan elmenti.\n"
+        "✏️ Később ugyanígy módosíthatod."
+    )
+
+
+# ============================================================
+# ÁRAJÁNLAT + CÉGADATOK SZÖVEGES BEVITEL
 # ============================================================
 
 async def handle_text(
@@ -352,12 +606,100 @@ async def handle_text(
     if not update.message.text:
         return
 
+    text = update.message.text.strip()
+
+    # ========================================================
+    # CÉGADATOK
+    # ========================================================
+
+    if context.user_data.get("company_step"):
+
+        user_id = update.effective_user.id
+
+        data = parse_company_data(text)
+
+        missing = []
+
+        if not data["company_name"]:
+            missing.append("🏢 Cégnév")
+
+        if not data["phone"]:
+            missing.append("📞 Telefonszám")
+
+        if not data["email"]:
+            missing.append("📧 E-mail")
+
+        if not data["address"]:
+            missing.append("🏠 Cím")
+
+        if not data["tax_number"]:
+            missing.append("🧾 Adószám")
+
+        if missing:
+
+            await update.message.reply_text(
+
+                "⚠️ Nem találtam meg minden adatot.\n\n"
+
+                "Hiányzik:\n"
+                + "\n".join(missing)
+                + "\n\n"
+
+                "Kérlek, küldd el újra EGYETLEN üzenetben "
+                "ebben a formában:\n\n"
+
+                "Cégnév: ...\n"
+                "Telefonszám: ...\n"
+                "E-mail: ...\n"
+                "Cím: ...\n"
+                "Adószám: ..."
+            )
+
+            return
+
+        save_company_data(
+            user_id,
+            data
+        )
+
+        context.user_data.clear()
+
+        await update.message.reply_text(
+
+            "✅ Cégadatok sikeresen elmentve!\n\n"
+
+            "🏢 Cégnév: "
+            + data["company_name"] + "\n"
+
+            "📞 Telefonszám: "
+            + data["phone"] + "\n"
+
+            "📧 E-mail: "
+            + data["email"] + "\n"
+
+            "🏠 Cím: "
+            + data["address"] + "\n"
+
+            "🧾 Adószám: "
+            + data["tax_number"] + "\n\n"
+
+            "💾 Az adatok megmaradnak.\n"
+            "📄 A későbbi PDF árajánlatokban "
+            "automatikusan felhasználhatók.",
+
+            reply_markup=main_keyboard()
+        )
+
+        return
+
+    # ========================================================
+    # ÁRAJÁNLAT
+    # ========================================================
+
     step = context.user_data.get("quote_step")
 
     if not step:
         return
-
-    text = update.message.text.strip()
 
 
     # 1. NÉV
@@ -486,7 +828,6 @@ async def handle_text(
 
         data = context.user_data
 
-        # Biztonsági ellenőrzés még mentés előtt
         if not get_active_subscription(user_id):
 
             context.user_data.clear()
@@ -756,43 +1097,6 @@ async def ai_helper(
 
 
 # ============================================================
-# CÉGADATOK
-# ============================================================
-
-async def company(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    if not await require_subscription(
-        update,
-        context
-    ):
-        return
-
-    await query.edit_message_text(
-
-        "⚙️ Cégadatok\n\n"
-
-        "Itt lesznek megadhatók a vállalkozásod adatai:\n\n"
-
-        "🏢 Cégnév\n"
-        "📞 Telefonszám\n"
-        "📧 E-mail\n"
-        "🏠 Cím\n"
-        "🧾 Adószám\n\n"
-
-        "A szerkesztést a következő fejlesztésben adjuk hozzá.",
-
-        reply_markup=main_keyboard()
-    )
-
-
-# ============================================================
 # ELŐFIZETÉS MENÜ
 # ============================================================
 
@@ -965,10 +1269,13 @@ async def subscription_status(
 
         try:
             expires = datetime.fromisoformat(expires_at)
+
             formatted_date = expires.strftime(
                 "%Y.%m.%d %H:%M"
             )
+
         except Exception:
+
             formatted_date = expires_at
 
         text = (
@@ -981,12 +1288,14 @@ async def subscription_status(
         )
 
         if recurring:
+
             text += (
                 "\n🔄 Automatikusan megújuló "
                 "előfizetés."
             )
 
         else:
+
             text += (
                 "\n📌 Egyszeri 7 napos "
                 "hozzáférés."
@@ -1050,7 +1359,6 @@ async def successful_payment(
 
     now = datetime.now()
 
-
     if payload == "PRO_7_DAYS":
 
         plan = "PRO"
@@ -1060,7 +1368,6 @@ async def successful_payment(
         )
 
         recurring = 0
-
 
     elif payload == "PRO_PLUS_MONTHLY":
 
@@ -1078,7 +1385,6 @@ async def successful_payment(
 
         recurring = 1
 
-
     else:
 
         await update.message.reply_text(
@@ -1086,7 +1392,6 @@ async def successful_payment(
         )
 
         return
-
 
     conn = sqlite3.connect(DB_FILE)
 
@@ -1120,7 +1425,6 @@ async def successful_payment(
     conn.commit()
     conn.close()
 
-
     if recurring:
 
         renewal_text = (
@@ -1132,7 +1436,6 @@ async def successful_payment(
         renewal_text = (
             "📅 A hozzáférés 7 napig aktív."
         )
-
 
     await update.message.reply_text(
 
@@ -1243,6 +1546,8 @@ async def back_menu(
 
     await query.answer()
 
+    context.user_data.clear()
+
     await query.edit_message_text(
 
         "🤖 Főmenü",
@@ -1276,7 +1581,6 @@ def main():
         .token(BOT_TOKEN)
         .build()
     )
-
 
     # ========================================================
     # PARANCSOK
@@ -1317,7 +1621,6 @@ def main():
         )
     )
 
-
     # ========================================================
     # ÁRAJÁNLAT
     # ========================================================
@@ -1328,7 +1631,6 @@ def main():
             pattern="^new_quote$"
         )
     )
-
 
     # ========================================================
     # ÜGYFELEK
@@ -1341,7 +1643,6 @@ def main():
         )
     )
 
-
     # ========================================================
     # AJÁNLATOK
     # ========================================================
@@ -1352,7 +1653,6 @@ def main():
             pattern="^quotes$"
         )
     )
-
 
     # ========================================================
     # AI
@@ -1365,7 +1665,6 @@ def main():
         )
     )
 
-
     # ========================================================
     # CÉGADATOK
     # ========================================================
@@ -1377,6 +1676,12 @@ def main():
         )
     )
 
+    app.add_handler(
+        CallbackQueryHandler(
+            company_edit,
+            pattern="^company_edit$"
+        )
+    )
 
     # ========================================================
     # ELŐFIZETÉS
@@ -1410,7 +1715,6 @@ def main():
         )
     )
 
-
     # ========================================================
     # VISSZA
     # ========================================================
@@ -1421,7 +1725,6 @@ def main():
             pattern="^back_menu$"
         )
     )
-
 
     # ========================================================
     # FIZETÉS
@@ -1440,7 +1743,6 @@ def main():
         )
     )
 
-
     # ========================================================
     # SZÖVEGES ÜZENETEK
     # ========================================================
@@ -1451,7 +1753,6 @@ def main():
             handle_text
         )
     )
-
 
     # ========================================================
     # INDÍTÁS
