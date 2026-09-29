@@ -2479,10 +2479,10 @@ def main():
     app.add_error_handler(
         error_handler
     )
-
     print(
         "AI Arjanlat Pro started"
     )
+    
 
     app.run_polling(
         allowed_updates=Update.ALL_TYPES
